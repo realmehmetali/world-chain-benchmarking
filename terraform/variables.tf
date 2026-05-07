@@ -21,3 +21,9 @@ variable "root_volume_size" {
   type        = number
   default     = 50
 }
+
+variable "environment" {
+  description = "Environment name. Selects which crypto/<env>/us-east-1 snapshot bucket policies to attach to the EC2 instance role."
+  type        = string
+  default     = "dev"
+}

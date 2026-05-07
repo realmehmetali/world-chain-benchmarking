@@ -84,10 +84,51 @@ resource "aws_security_group" "benchmark" {
   }
 }
 
+resource "aws_iam_role" "benchmark" {
+  name_prefix = "benchmark-${local.caller_id}-"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+# Snapshot bucket policies live in the infrastructure repo
+# (crypto/dev/us-east-1/s3-world-chain-benchmark-snapshots.tf). They are
+# referenced here by ARN — built at plan time so the apply does not depend on
+# data-source resolution against the policies.
+locals {
+  snapshot_policy_arns = [
+    for action in ["read", "write"] :
+    format(
+      "arn:aws:iam::%s:policy/system/world-chain-benchmark-snapshot-%s-%s",
+      data.aws_caller_identity.current.account_id,
+      action,
+      var.environment,
+    )
+  ]
+}
+
+resource "aws_iam_role_policy_attachment" "benchmark_snapshot" {
+  for_each   = toset(local.snapshot_policy_arns)
+  role       = aws_iam_role.benchmark.name
+  policy_arn = each.value
+}
+
+resource "aws_iam_instance_profile" "benchmark" {
+  name_prefix = "benchmark-${local.caller_id}-"
+  role        = aws_iam_role.benchmark.name
+}
+
 resource "aws_instance" "benchmark" {
-  ami           = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu.id
-  instance_type = var.instance_type
-  key_name      = aws_key_pair.benchmark.key_name
+  ami                  = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu.id
+  instance_type        = var.instance_type
+  key_name             = aws_key_pair.benchmark.key_name
+  iam_instance_profile = aws_iam_instance_profile.benchmark.name
 
   vpc_security_group_ids = [aws_security_group.benchmark.id]
 
