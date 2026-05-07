@@ -1,70 +1,55 @@
-set dotenv-load
-
 ssh_opts := "-o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 ssh_key := "-i terraform/benchmark-key.pem"
 
 default:
     @just --list
 
-# Provision instance, deploy scenario config, and launch background setup
-init scenario:
+# Provision the benchmarking instance and wait for cloud-init to finish
+up:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # Validate scenario
-    just validate "{{scenario}}"
-
-    # Parse region and optional instance_type from scenario
-    REGION=$(yq -r '.region' "{{scenario}}")
-    INSTANCE_TYPE=$(yq -r '.instance_type // ""' "{{scenario}}")
-
-    # Terraform apply
-    echo "==> Provisioning instance in $REGION..."
-    terraform -chdir=terraform init -upgrade -input=false > /dev/null
-    TF_VARS=(-var "region=$REGION")
-    if [[ -n "$INSTANCE_TYPE" ]]; then
-        TF_VARS+=(-var "instance_type=$INSTANCE_TYPE")
+    # Short-circuit if terraform state already has a live instance
+    if INSTANCE_ID=$(terraform -chdir=terraform output -raw instance_id 2>/dev/null) && [[ -n "$INSTANCE_ID" ]]; then
+        STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "missing")
+        if [[ "$STATE" == "running" || "$STATE" == "pending" ]]; then
+            echo "==> Instance $INSTANCE_ID is already $STATE. Use 'just ssh' to connect or 'just down' to destroy."
+            exit 0
+        fi
     fi
-    terraform -chdir=terraform apply -auto-approve "${TF_VARS[@]}"
 
+    echo "==> Provisioning instance..."
+    terraform -chdir=terraform init -upgrade -input=false > /dev/null
+    terraform -chdir=terraform apply -auto-approve
+
+    IP=$(terraform -chdir=terraform output -raw public_ip)
+    SSH="ssh {{ssh_opts}} {{ssh_key}} ubuntu@$IP"
+
+    echo "==> Waiting for SSH on $IP..."
+    until $SSH true 2>/dev/null; do sleep 2; done
+
+    echo "==> Waiting for cloud-init..."
+    $SSH 'cloud-init status --wait' > /dev/null 2>&1
+
+    echo "==> Instance ready. Use 'just ssh' to connect."
+
+# Download a chain snapshot to /data/snapshot on the instance
+snapshot url:
+    #!/usr/bin/env bash
+    set -euo pipefail
     IP=$(terraform -chdir=terraform output -raw public_ip)
     SSH="ssh {{ssh_opts}} {{ssh_key}} ubuntu@$IP"
     SCP="scp {{ssh_opts}} {{ssh_key}}"
 
-    # Wait for SSH + cloud-init
-    echo "==> Waiting for SSH on $IP..."
-    until $SSH true 2>/dev/null; do sleep 2; done
-    echo "==> Waiting for cloud-init..."
-    $SSH 'cloud-init status --wait' > /dev/null 2>&1
+    echo "==> Deploying download-snapshot.sh to $IP..."
+    $SCP scripts/download-snapshot.sh ubuntu@$IP:/tmp/download-snapshot.sh
+    $SSH 'chmod +x /tmp/download-snapshot.sh'
 
-    # Check if setup is already running or complete
-    REMOTE_STATUS=$($SSH 'cat /data/setup/status 2>/dev/null || echo "none"')
-    if [[ "$REMOTE_STATUS" == "ready" ]]; then
-        echo "Setup already completed. Use 'just status' to check or 'just ssh' to connect."
-        exit 0
-    fi
-    if [[ "$REMOTE_STATUS" =~ ^(starting|downloading|verifying|pulling)$ ]]; then
-        echo "Setup already in progress (status: $REMOTE_STATUS). Use 'just status' to monitor."
-        exit 0
-    fi
+    echo "==> Downloading snapshot..."
+    $SSH "/tmp/download-snapshot.sh '{{url}}'"
 
-    # Expand env vars in scenario YAML and deploy files
-    echo "==> Deploying scenario config and scripts..."
-    $SSH 'sudo mkdir -p /data/setup && sudo chown ubuntu:ubuntu /data/setup'
-    envsubst < "{{scenario}}" | $SSH 'cat > /data/setup/scenario.yaml'
-    $SCP scripts/setup.sh scripts/verify-blocks.sh ubuntu@$IP:/data/setup/
-    $SSH 'chmod +x /data/setup/setup.sh /data/setup/verify-blocks.sh'
-
-    # Launch setup as a supervised systemd unit
-    echo "==> Launching background setup..."
-    $SSH 'sudo systemd-run --unit=benchmark-setup --uid=ubuntu --gid=ubuntu \
-        --property=StandardOutput=append:/data/setup/setup.log \
-        --property=StandardError=append:/data/setup/setup.log \
-        /data/setup/setup.sh'
-
-    echo "==> Setup launched. Use 'just status' to monitor progress."
-
-# Show instance state and setup progress
+# Show instance state and cloud-init status
 status:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -73,16 +58,13 @@ status:
         --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "unknown")
     echo "--- Instance: $STATE ---"
     if [[ "$STATE" != "running" ]]; then
-        echo "Instance is not running. Cannot check setup status."
+        echo "Instance is not running."
         exit 0
     fi
     IP=$(terraform -chdir=terraform output -raw public_ip)
     SSH="ssh {{ssh_opts}} {{ssh_key}} ubuntu@$IP"
-    echo "--- Setup Status ---"
-    $SSH 'cat /data/setup/status 2>/dev/null || echo "not started"'
-    echo ""
-    echo "--- Last 20 log lines ---"
-    $SSH 'tail -20 /data/setup/setup.log 2>/dev/null || echo "no log file"'
+    echo "--- cloud-init ---"
+    $SSH 'cloud-init status' 2>/dev/null || echo "ssh not ready"
 
 # SSH into the instance
 ssh:
@@ -92,32 +74,6 @@ ssh:
     echo "Waiting for SSH on $IP..."
     until ssh {{ssh_opts}} {{ssh_key}} ubuntu@$IP true 2>/dev/null; do sleep 2; done
     ssh {{ssh_opts}} {{ssh_key}} ubuntu@$IP
-
-# Validate a scenario file
-validate scenario:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ ! -f "{{scenario}}" ]]; then
-        echo "Error: scenario file '{{scenario}}' not found"
-        exit 1
-    fi
-    ERRORS=()
-    for field in name region image rpc_url; do
-        val=$(yq -r ".$field // \"\"" "{{scenario}}")
-        if [[ -z "$val" ]]; then
-            ERRORS+=("missing required field: $field")
-        fi
-    done
-    SNAPSHOT_URL=$(yq -r '.snapshot_url // ""' "{{scenario}}")
-    if [[ -z "$SNAPSHOT_URL" ]]; then
-        ERRORS+=("missing required field: snapshot_url")
-    fi
-    if [[ ${#ERRORS[@]} -gt 0 ]]; then
-        echo "Scenario validation failed:"
-        for err in "${ERRORS[@]}"; do echo "  - $err"; done
-        exit 1
-    fi
-    echo "Scenario '{{scenario}}' is valid."
 
 # Destroy the instance
 down:

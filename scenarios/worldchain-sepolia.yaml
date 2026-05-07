@@ -1,5 +1,0 @@
-name: worldchain-sepolia
-region: us-east-1
-image: ghcr.io/worldcoin/world-chain-builder:latest
-snapshot_url: s3://world-chain-testnet-snapshots/reth_archive.tar.lz4
-rpc_url: https://worldchain-sepolia.g.alchemy.com/public
