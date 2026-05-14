@@ -24,6 +24,11 @@ locals {
   # sanitised to characters AWS resource names accept. Used as a per-operator
   # suffix so concurrent users don't collide on globally-unique resource names.
   caller_id = replace(regex("[^/]+$", data.aws_caller_identity.current.arn), "/[^a-zA-Z0-9-]/", "-")
+  # Shorter variant for IAM resources, whose name_prefix is capped at 38 chars
+  # (= 64-char role name budget minus terraform's random suffix). For SSO ARNs
+  # ending in an email, drops the @domain part; capped at 27 chars so the
+  # "benchmark-<id>-" prefix still fits.
+  caller_id_short = substr(split("@", local.caller_id)[0], 0, 27)
 }
 
 resource "tls_private_key" "benchmark" {
@@ -85,7 +90,7 @@ resource "aws_security_group" "benchmark" {
 }
 
 resource "aws_iam_role" "benchmark" {
-  name_prefix = "benchmark-${local.caller_id}-"
+  name_prefix = "benchmark-${local.caller_id_short}-"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -120,7 +125,7 @@ resource "aws_iam_role_policy_attachment" "benchmark_snapshot" {
 }
 
 resource "aws_iam_instance_profile" "benchmark" {
-  name_prefix = "benchmark-${local.caller_id}-"
+  name_prefix = "benchmark-${local.caller_id_short}-"
   role        = aws_iam_role.benchmark.name
 }
 
@@ -143,5 +148,13 @@ resource "aws_instance" "benchmark" {
 
   tags = {
     Name = "benchmark-${local.caller_id}"
+  }
+
+  # Critical: never let terraform stop/start or replace a running instance.
+  # `i4i.4xlarge` instance store NVMe is wiped on stop/start, and a fresh AMI
+  # would force replacement. Both would destroy /data. Edits to user-data.sh
+  # only take effect on instances created by a future `just up` after `just down`.
+  lifecycle {
+    ignore_changes = [user_data, ami]
   }
 }

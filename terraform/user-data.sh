@@ -2,7 +2,7 @@
 set -euo pipefail
 
 apt-get update
-apt-get install -y git curl build-essential zstd lz4 nvme-cli jq aria2
+apt-get install -y git curl build-essential zstd lz4 nvme-cli jq aria2 pv
 
 # Mount instance store NVMe SSD at /data
 NVME_DEVICE=$(nvme list -o json | jq -r '.Devices[] | select(.ModelNumber | contains("Instance Storage")) | .DevicePath' | head -1)
