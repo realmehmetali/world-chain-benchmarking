@@ -8,6 +8,7 @@ fi
 
 URL="$1"
 SNAPSHOT_DIR="/data/snapshot"
+TMP_DIR="/data/tmp"
 
 case "$URL" in
     *.tar.lz4|*.lz4) DECOMPRESS="lz4 -d" ;;
@@ -21,15 +22,20 @@ esac
 sudo mkdir -p "$SNAPSHOT_DIR"
 sudo chown "$(id -u):$(id -g)" "$SNAPSHOT_DIR"
 rm -rf "${SNAPSHOT_DIR:?}/"*
+sudo mkdir -p "$TMP_DIR"
+sudo chown "$(id -u):$(id -g)" "$TMP_DIR"
+
+echo "==> Disk free space:"
+df -h "$SNAPSHOT_DIR" "$TMP_DIR" 2>/dev/null || true
 
 case "$URL" in
     s3://*)
         timeout 7200 s5cmd --no-sign-request cat "$URL" | $DECOMPRESS | tar x -C "$SNAPSHOT_DIR"
         ;;
     https://*|http://*)
-        TMPFILE="/tmp/snapshot-download.tmp"
+        TMPFILE="$TMP_DIR/snapshot-download.tmp"
         rm -f "$TMPFILE"
-        aria2c -x 16 -s 16 --file-allocation=none -d /tmp -o snapshot-download.tmp "$URL"
+        aria2c -x 16 -s 16 --file-allocation=none -d "$TMP_DIR" -o snapshot-download.tmp "$URL"
         $DECOMPRESS "$TMPFILE" | tar x -C "$SNAPSHOT_DIR"
         rm -f "$TMPFILE"
         ;;
