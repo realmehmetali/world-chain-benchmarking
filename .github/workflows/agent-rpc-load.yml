@@ -1,0 +1,26 @@
+name: Agent RPC load
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test synthetic workload
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Run tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s benchmarks/agent_rpc_load -p 'test_*.py' -v
+
+      - name: Check CLI
+        run: python3 benchmarks/agent_rpc_load/agent_rpc_load.py --help

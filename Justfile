@@ -104,6 +104,36 @@ upload-cancel:
     $SSH "kill -TERM -- -$PID 2>/dev/null || kill -TERM $PID 2>/dev/null || true; sleep 2; kill -KILL -- -$PID 2>/dev/null || true; rm -f $PIDFILE"
     echo "done"
 
+# Run read-only, agent-shaped JSON-RPC load on the benchmark instance.
+agent-load-read rpc_url="http://127.0.0.1:8545" agents="50" requests_per_agent="10" concurrency="32":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    IP=$(terraform -chdir=terraform output -raw public_ip)
+    SSH="ssh {{ssh_opts}} {{ssh_key}} ubuntu@$IP"
+    SCP="scp {{ssh_opts}} {{ssh_key}}"
+
+    echo "==> Deploying the synthetic agent RPC benchmark to $IP..."
+    $SCP benchmarks/agent_rpc_load/agent_rpc_load.py ubuntu@$IP:/tmp/agent_rpc_load.py
+    $SSH "python3 /tmp/agent_rpc_load.py read --rpc-url '{{rpc_url}}' --agents '{{agents}}' --requests-per-agent '{{requests_per_agent}}' --concurrency '{{concurrency}}'"
+
+# Replay caller-supplied synthetic signed transactions and wait for receipts.
+agent-load-replay corpus rpc_url="http://127.0.0.1:8545" concurrency="32" receipt_timeout_seconds="60":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    IP=$(terraform -chdir=terraform output -raw public_ip)
+    SSH="ssh {{ssh_opts}} {{ssh_key}} ubuntu@$IP"
+    SCP="scp {{ssh_opts}} {{ssh_key}}"
+    REMOTE_CORPUS=/tmp/agent-load-corpus.jsonl
+
+    echo "==> Deploying the synthetic agent RPC benchmark and corpus to $IP..."
+    $SCP benchmarks/agent_rpc_load/agent_rpc_load.py ubuntu@$IP:/tmp/agent_rpc_load.py
+    $SCP "{{corpus}}" ubuntu@$IP:$REMOTE_CORPUS
+    $SSH "python3 /tmp/agent_rpc_load.py replay --rpc-url '{{rpc_url}}' --input '$REMOTE_CORPUS' --concurrency '{{concurrency}}' --receipt-timeout-seconds '{{receipt_timeout_seconds}}' --allow-writes"
+
+# Run the dependency-free benchmark regression tests locally.
+test-agent-load:
+    python3 -m unittest discover -s benchmarks/agent_rpc_load -p 'test_*.py'
+
 # Show instance state and cloud-init status
 status:
     #!/usr/bin/env bash
