@@ -76,6 +76,7 @@ class ReplayClient:
             for raw_transaction in confirmed_transactions
         }
         self.receipt_delay_seconds = receipt_delay_seconds
+        self.timeout_seconds = receipt_delay_seconds
         self.lock = threading.Lock()
         self.events: list[tuple[str, str, float]] = []
 
@@ -263,6 +264,45 @@ class AgentRpcLoadTests(unittest.TestCase):
         self.assertLess(early_receipt_at, delayed_submission_at)
         self.assertEqual(outcomes["early"]["state"], "confirmed")
         self.assertLess(outcomes["early"]["receipt_latency_ms"], 40)
+
+    def test_replay_reserves_worker_for_due_scheduled_submission(self) -> None:
+        client = ReplayClient(
+            confirmed_transactions={"0x01", "0x02"},
+            receipt_delay_seconds=0.05,
+        )
+        records = [
+            ReplayRecord("agent-1", "0x01", "initial"),
+            ReplayRecord(
+                "agent-1",
+                "0x02",
+                "replacement",
+                send_after_ms=10,
+            ),
+        ]
+
+        summary = run_replay_workload(
+            client,
+            records=records,
+            concurrency=1,
+            receipt_timeout_seconds=0.2,
+            receipt_poll_interval_seconds=0.001,
+        )
+
+        initial_hash = client.transaction_hash("0x01")
+        initial_receipt_at = next(
+            called_at
+            for method, value, called_at in client.events
+            if method == "eth_getTransactionReceipt" and value == initial_hash
+        )
+        replacement_submission_at = next(
+            called_at
+            for method, value, called_at in client.events
+            if method == "eth_sendRawTransaction" and value == "0x02"
+        )
+
+        self.assertLess(replacement_submission_at, initial_receipt_at)
+        self.assertEqual(summary["receipts"]["confirmed"], 2)
+        self.assertEqual(summary["receipts"]["timed_out"], 0)
 
     def test_replay_does_not_confirm_receipts_observed_after_deadline(self) -> None:
         client = ReplayClient(

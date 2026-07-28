@@ -390,6 +390,7 @@ def run_replay_workload(
     accepted_submissions = 0
     call_order = 0
     last_scheduled_kind: str | None = None
+    rpc_timeout_seconds = getattr(client, "timeout_seconds", math.inf)
     in_flight: dict[
         Future[tuple[RpcCallResult, float]],
         tuple[int, str, tuple[int, ReplayRecord] | str],
@@ -410,15 +411,24 @@ def run_replay_workload(
     # scheduling waits, preserving the global concurrency limit.
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         while submission_queue or receipt_queue or in_flight:
-            now = time.perf_counter()
+            reserved_receipt_wake_at = math.inf
 
             while len(in_flight) < concurrency:
+                now = time.perf_counter()
                 submission_ready = (
                     bool(submission_queue) and submission_queue[0][0] <= now
                 )
                 receipt_ready = bool(receipt_queue) and receipt_queue[0][0] <= now
                 if not submission_ready and not receipt_ready:
                     break
+
+                if receipt_ready:
+                    _, _, transaction_hash = receipt_queue[0]
+                    tracker = accepted[transaction_hash]
+                    if now >= tracker.deadline:
+                        heapq.heappop(receipt_queue)
+                        tracker.outcome = timed_out_outcome(transaction_hash, tracker)
+                        continue
 
                 # Alternate task types when both are due so neither a large
                 # submission batch nor pending receipts can starve the other.
@@ -432,6 +442,26 @@ def run_replay_workload(
                     kind = "submission"
                 else:
                     kind = "receipt"
+
+                # A receipt attempt can run until the RPC timeout. When it
+                # would consume the final worker across the next scheduled
+                # submission, keep that worker free instead. Calls that can
+                # finish before the deadline may still use the full pool.
+                if (
+                    kind == "receipt"
+                    and len(in_flight) == concurrency - 1
+                    and submission_queue
+                    and now + rpc_timeout_seconds >= submission_queue[0][0]
+                ):
+                    if submission_ready:
+                        kind = "submission"
+                    else:
+                        transaction_hash = receipt_queue[0][2]
+                        reserved_receipt_wake_at = min(
+                            submission_queue[0][0],
+                            accepted[transaction_hash].deadline,
+                        )
+                        break
 
                 if kind == "submission":
                     _, submission_order, record = heapq.heappop(submission_queue)
@@ -447,11 +477,6 @@ def run_replay_workload(
                 else:
                     _, _, transaction_hash = heapq.heappop(receipt_queue)
                     tracker = accepted[transaction_hash]
-                    if now >= tracker.deadline:
-                        tracker.outcome = timed_out_outcome(
-                            transaction_hash, tracker
-                        )
-                        continue
                     future = executor.submit(
                         execute_call,
                         "eth_getTransactionReceipt",
@@ -463,19 +488,19 @@ def run_replay_workload(
                 call_order += 1
                 last_scheduled_kind = kind
 
+            next_receipt_due = receipt_queue[0][0] if receipt_queue else math.inf
+            if reserved_receipt_wake_at < math.inf:
+                next_receipt_due = reserved_receipt_wake_at
+            next_due = min(
+                submission_queue[0][0] if submission_queue else math.inf,
+                next_receipt_due,
+            )
+
             if not in_flight:
-                next_due = min(
-                    submission_queue[0][0] if submission_queue else math.inf,
-                    receipt_queue[0][0] if receipt_queue else math.inf,
-                )
                 if next_due < math.inf:
                     time.sleep(max(0.0, next_due - time.perf_counter()))
                 continue
 
-            next_due = min(
-                submission_queue[0][0] if submission_queue else math.inf,
-                receipt_queue[0][0] if receipt_queue else math.inf,
-            )
             wait_timeout = (
                 max(0.0, next_due - time.perf_counter())
                 if len(in_flight) < concurrency and next_due < math.inf
