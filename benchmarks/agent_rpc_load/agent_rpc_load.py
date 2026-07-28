@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import heapq
 import json
 import math
 import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -42,6 +43,17 @@ class ReplayRecord:
     raw_transaction: str
     label: str
     send_after_ms: int = 0
+
+
+@dataclass
+class _ReceiptTracker:
+    """Receipt state for one unique accepted transaction hash."""
+
+    record: ReplayRecord
+    submitted_at: float
+    deadline: float
+    order: int
+    outcome: dict[str, Any] | None = None
 
 
 class JsonRpcClient:
@@ -357,61 +369,186 @@ def run_replay_workload(
     receipt_timeout_seconds: float,
     receipt_poll_interval_seconds: float,
 ) -> dict[str, Any]:
-    """Submit signed synthetic transactions, then measure time to receipt."""
+    """Submit signed synthetic transactions while measuring time to receipt."""
     metrics = Metrics()
     started = time.perf_counter()
 
-    def submit(record: ReplayRecord) -> tuple[ReplayRecord, RpcCallResult, float]:
-        scheduled_at = started + record.send_after_ms / 1000
-        remaining = scheduled_at - time.perf_counter()
-        if remaining > 0:
-            time.sleep(remaining)
-        result = client.call("eth_sendRawTransaction", [record.raw_transaction])
-        metrics.record(result)
-        return record, result, time.perf_counter()
+    def execute_call(method: str, params: list[Any]) -> tuple[RpcCallResult, float]:
+        result = client.call(method, params)
+        return result, time.perf_counter()
 
-    scheduled_records = sorted(records, key=lambda record: record.send_after_ms)
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        submissions = list(executor.map(submit, scheduled_records))
-
-    accepted: dict[str, tuple[ReplayRecord, float]] = {}
+    scheduled_records = sorted(
+        enumerate(records), key=lambda item: (item[1].send_after_ms, item[0])
+    )
+    submission_queue = [
+        (started + record.send_after_ms / 1000, order, record)
+        for order, (_, record) in enumerate(scheduled_records)
+    ]
+    heapq.heapify(submission_queue)
+    receipt_queue: list[tuple[float, int, str]] = []
+    accepted: dict[str, _ReceiptTracker] = {}
     accepted_submissions = 0
-    for record, result, submitted_at in submissions:
-        if result.ok and isinstance(result.result, str):
-            accepted_submissions += 1
-            accepted.setdefault(result.result, (record, submitted_at))
+    call_order = 0
+    last_scheduled_kind: str | None = None
+    in_flight: dict[
+        Future[tuple[RpcCallResult, float]],
+        tuple[int, str, tuple[int, ReplayRecord] | str],
+    ] = {}
 
-    def wait_for_receipt(
-        item: tuple[str, tuple[ReplayRecord, float]]
+    def timed_out_outcome(
+        transaction_hash: str, tracker: _ReceiptTracker
     ) -> dict[str, Any]:
-        transaction_hash, (record, submitted_at) = item
-        deadline = submitted_at + receipt_timeout_seconds
+        return {
+            "agent_id": tracker.record.agent_id,
+            "label": tracker.record.label,
+            "transaction_hash": transaction_hash,
+            "state": "timed_out",
+            "receipt_latency_ms": None,
+        }
 
-        while True:
-            result = client.call("eth_getTransactionReceipt", [transaction_hash])
-            metrics.record(result)
-            if result.ok and isinstance(result.result, dict):
-                return {
-                    "agent_id": record.agent_id,
-                    "label": record.label,
-                    "transaction_hash": transaction_hash,
-                    "state": "confirmed",
-                    "receipt_latency_ms": round(_elapsed_ms(submitted_at), 3),
-                    "block_number": result.result.get("blockNumber"),
-                    "status": result.result.get("status"),
-                }
-            if time.perf_counter() >= deadline:
-                return {
-                    "agent_id": record.agent_id,
-                    "label": record.label,
-                    "transaction_hash": transaction_hash,
-                    "state": "timed_out",
-                    "receipt_latency_ms": None,
-                }
-            time.sleep(receipt_poll_interval_seconds)
-
+    # Workers perform one RPC attempt at a time. The coordinator owns all
+    # scheduling waits, preserving the global concurrency limit.
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        receipt_outcomes = list(executor.map(wait_for_receipt, accepted.items()))
+        while submission_queue or receipt_queue or in_flight:
+            now = time.perf_counter()
+
+            while len(in_flight) < concurrency:
+                submission_ready = (
+                    bool(submission_queue) and submission_queue[0][0] <= now
+                )
+                receipt_ready = bool(receipt_queue) and receipt_queue[0][0] <= now
+                if not submission_ready and not receipt_ready:
+                    break
+
+                # Alternate task types when both are due so neither a large
+                # submission batch nor pending receipts can starve the other.
+                if submission_ready and receipt_ready:
+                    kind = (
+                        "receipt"
+                        if last_scheduled_kind == "submission"
+                        else "submission"
+                    )
+                elif submission_ready:
+                    kind = "submission"
+                else:
+                    kind = "receipt"
+
+                if kind == "submission":
+                    _, submission_order, record = heapq.heappop(submission_queue)
+                    future = executor.submit(
+                        execute_call,
+                        "eth_sendRawTransaction",
+                        [record.raw_transaction],
+                    )
+                    payload: tuple[int, ReplayRecord] | str = (
+                        submission_order,
+                        record,
+                    )
+                else:
+                    _, _, transaction_hash = heapq.heappop(receipt_queue)
+                    tracker = accepted[transaction_hash]
+                    if now >= tracker.deadline:
+                        tracker.outcome = timed_out_outcome(
+                            transaction_hash, tracker
+                        )
+                        continue
+                    future = executor.submit(
+                        execute_call,
+                        "eth_getTransactionReceipt",
+                        [transaction_hash],
+                    )
+                    payload = transaction_hash
+
+                in_flight[future] = (call_order, kind, payload)
+                call_order += 1
+                last_scheduled_kind = kind
+
+            if not in_flight:
+                next_due = min(
+                    submission_queue[0][0] if submission_queue else math.inf,
+                    receipt_queue[0][0] if receipt_queue else math.inf,
+                )
+                if next_due < math.inf:
+                    time.sleep(max(0.0, next_due - time.perf_counter()))
+                continue
+
+            next_due = min(
+                submission_queue[0][0] if submission_queue else math.inf,
+                receipt_queue[0][0] if receipt_queue else math.inf,
+            )
+            wait_timeout = (
+                max(0.0, next_due - time.perf_counter())
+                if len(in_flight) < concurrency and next_due < math.inf
+                else None
+            )
+            completed, _ = wait(
+                in_flight,
+                timeout=wait_timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                continue
+
+            for future in sorted(completed, key=lambda item: in_flight[item][0]):
+                _, kind, payload = in_flight.pop(future)
+                result, completed_at = future.result()
+                metrics.record(result)
+
+                if kind == "submission":
+                    assert isinstance(payload, tuple)
+                    submission_order, record = payload
+                    if result.ok and isinstance(result.result, str):
+                        accepted_submissions += 1
+                        if result.result not in accepted:
+                            tracker = _ReceiptTracker(
+                                record=record,
+                                submitted_at=completed_at,
+                                deadline=completed_at + receipt_timeout_seconds,
+                                order=submission_order,
+                            )
+                            accepted[result.result] = tracker
+                            heapq.heappush(
+                                receipt_queue,
+                                (completed_at, tracker.order, result.result),
+                            )
+                    continue
+
+                transaction_hash = payload
+                assert isinstance(transaction_hash, str)
+                tracker = accepted[transaction_hash]
+                if completed_at >= tracker.deadline:
+                    tracker.outcome = timed_out_outcome(transaction_hash, tracker)
+                elif result.ok and isinstance(result.result, dict):
+                    tracker.outcome = {
+                        "agent_id": tracker.record.agent_id,
+                        "label": tracker.record.label,
+                        "transaction_hash": transaction_hash,
+                        "state": "confirmed",
+                        "receipt_latency_ms": round(
+                            (completed_at - tracker.submitted_at) * 1000, 3
+                        ),
+                        "block_number": result.result.get("blockNumber"),
+                        "status": result.result.get("status"),
+                    }
+                else:
+                    heapq.heappush(
+                        receipt_queue,
+                        (
+                            min(
+                                completed_at + receipt_poll_interval_seconds,
+                                tracker.deadline,
+                            ),
+                            tracker.order,
+                            transaction_hash,
+                        ),
+                    )
+
+    receipt_outcomes = [
+        outcome
+        for tracker in sorted(accepted.values(), key=lambda tracker: tracker.order)
+        if (outcome := tracker.outcome) is not None
+    ]
+    assert len(receipt_outcomes) == len(accepted)
 
     duration_seconds = time.perf_counter() - started
     confirmed_latencies = [
