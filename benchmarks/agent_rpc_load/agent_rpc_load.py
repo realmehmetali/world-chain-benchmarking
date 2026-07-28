@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import heapq
+import http.client
 import json
 import math
 import threading
@@ -99,7 +100,15 @@ class JsonRpcClient:
             ) as response:
                 response_body = response.read()
         except urllib.error.HTTPError as error:
-            response_body = error.read()
+            try:
+                response_body = error.read()
+            except http.client.IncompleteRead as read_error:
+                return RpcCallResult(
+                    method=method,
+                    latency_ms=_elapsed_ms(started),
+                    ok=False,
+                    transport_error=type(read_error).__name__,
+                )
             parsed = _parse_json(response_body)
             latency_ms = _elapsed_ms(started)
             if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
@@ -115,7 +124,12 @@ class JsonRpcClient:
                 ok=False,
                 transport_error=f"HTTP_{error.code}",
             )
-        except (OSError, TimeoutError, urllib.error.URLError) as error:
+        except (
+            http.client.IncompleteRead,
+            OSError,
+            TimeoutError,
+            urllib.error.URLError,
+        ) as error:
             return RpcCallResult(
                 method=method,
                 latency_ms=_elapsed_ms(started),
@@ -278,9 +292,11 @@ def run_read_workload(
     started = time.perf_counter()
 
     def calls() -> Iterable[tuple[str, list[Any]]]:
-        for agent_number in range(agents):
-            address = synthetic_address(seed, agent_number)
-            for _ in range(requests_per_agent):
+        addresses = [
+            synthetic_address(seed, agent_number) for agent_number in range(agents)
+        ]
+        for _ in range(requests_per_agent):
+            for address in addresses:
                 for method in selected_methods:
                     yield _read_params(method, address)
 
@@ -384,6 +400,11 @@ def run_replay_workload(
         (started + record.send_after_ms / 1000, order, record)
         for order, (_, record) in enumerate(scheduled_records)
     ]
+    submission_burst_sizes: dict[float, int] = {}
+    for scheduled_at, _, _ in submission_queue:
+        submission_burst_sizes[scheduled_at] = (
+            submission_burst_sizes.get(scheduled_at, 0) + 1
+        )
     heapq.heapify(submission_queue)
     receipt_queue: list[tuple[float, int, str]] = []
     accepted: dict[str, _ReceiptTracker] = {}
@@ -443,28 +464,36 @@ def run_replay_workload(
                 else:
                     kind = "receipt"
 
-                # A receipt attempt can run until the RPC timeout. When it
-                # would consume the final worker across the next scheduled
-                # submission, keep that worker free instead. Calls that can
+                # A receipt attempt can run until the RPC timeout. Preserve
+                # enough capacity for the entire next scheduled burst when
+                # the attempt could overlap its deadline. Calls that can
                 # finish before the deadline may still use the full pool.
                 if (
                     kind == "receipt"
-                    and len(in_flight) == concurrency - 1
                     and submission_queue
                     and now + rpc_timeout_seconds >= submission_queue[0][0]
                 ):
-                    if submission_ready:
-                        kind = "submission"
-                    else:
-                        transaction_hash = receipt_queue[0][2]
-                        reserved_receipt_wake_at = min(
-                            submission_queue[0][0],
-                            accepted[transaction_hash].deadline,
-                        )
-                        break
+                    next_submission_at = submission_queue[0][0]
+                    reserved_submission_slots = min(
+                        submission_burst_sizes[next_submission_at],
+                        concurrency,
+                    )
+                    if len(in_flight) >= concurrency - reserved_submission_slots:
+                        if submission_ready:
+                            kind = "submission"
+                        else:
+                            transaction_hash = receipt_queue[0][2]
+                            reserved_receipt_wake_at = min(
+                                next_submission_at,
+                                accepted[transaction_hash].deadline,
+                            )
+                            break
 
                 if kind == "submission":
-                    _, submission_order, record = heapq.heappop(submission_queue)
+                    scheduled_at, submission_order, record = heapq.heappop(
+                        submission_queue
+                    )
+                    submission_burst_sizes[scheduled_at] -= 1
                     future = executor.submit(
                         execute_call,
                         "eth_sendRawTransaction",
@@ -622,8 +651,8 @@ def _positive_int(value: str) -> int:
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
     return parsed
 
 
