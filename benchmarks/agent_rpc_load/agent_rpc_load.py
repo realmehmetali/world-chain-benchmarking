@@ -102,7 +102,12 @@ class JsonRpcClient:
         except urllib.error.HTTPError as error:
             try:
                 response_body = error.read()
-            except http.client.HTTPException as read_error:
+            except (
+                http.client.HTTPException,
+                OSError,
+                TimeoutError,
+                urllib.error.URLError,
+            ) as read_error:
                 return RpcCallResult(
                     method=method,
                     latency_ms=_elapsed_ms(started),
@@ -412,6 +417,8 @@ def run_replay_workload(
     accepted_submissions = 0
     call_order = 0
     last_scheduled_kind: str | None = None
+    priority_burst_at: float | None = None
+    priority_burst_launches = 0
     rpc_timeout_seconds = getattr(client, "timeout_seconds", math.inf)
     in_flight: dict[
         Future[tuple[RpcCallResult, float]],
@@ -446,6 +453,7 @@ def run_replay_workload(
                 # retain their original timing once earlier calls run long.
                 # Newer due bursts therefore take deterministic precedence
                 # over older backlog; the backlog resumes after they launch.
+                newest_due_at: float | None = None
                 while (
                     future_submission_queue
                     and future_submission_queue[0][0] <= now
@@ -456,6 +464,17 @@ def run_replay_workload(
                     heapq.heappush(
                         ready_submission_queue,
                         (-scheduled_at, submission_order, record),
+                    )
+                    if record.send_after_ms > 0 and (
+                        newest_due_at is None or scheduled_at > newest_due_at
+                    ):
+                        newest_due_at = scheduled_at
+
+                if newest_due_at is not None:
+                    priority_burst_at = newest_due_at
+                    priority_burst_launches = min(
+                        submission_burst_sizes[newest_due_at],
+                        concurrency - len(in_flight),
                     )
 
                 submission_ready = bool(ready_submission_queue)
@@ -471,9 +490,17 @@ def run_replay_workload(
                         tracker.outcome = timed_out_outcome(transaction_hash, tracker)
                         continue
 
-                # Alternate task types when both are due so neither a large
-                # submission batch nor pending receipts can starve the other.
-                if submission_ready and receipt_ready:
+                # Give a newly due burst the capacity available at that
+                # instant. After those launches, resume alternation so a
+                # large delayed batch cannot starve receipt polling.
+                priority_submission_ready = (
+                    submission_ready
+                    and priority_burst_launches > 0
+                    and -ready_submission_queue[0][0] == priority_burst_at
+                )
+                if priority_submission_ready:
+                    kind = "submission"
+                elif submission_ready and receipt_ready:
                     kind = (
                         "receipt"
                         if last_scheduled_kind == "submission"
@@ -485,11 +512,14 @@ def run_replay_workload(
                     kind = "receipt"
 
                 # Any RPC attempt can run until the RPC timeout. Preserve
-                # enough capacity for the entire next scheduled burst when
-                # the attempt could overlap its deadline. This applies to
-                # earlier submissions as well as receipt polls.
+                # capacity for the next scheduled burst when the attempt
+                # could overlap its deadline. Receipt polls may yield the
+                # whole pool, but let at least one earlier ready submission
+                # proceed so a full-size future burst cannot pre-idle every
+                # worker.
                 if (
-                    future_submission_queue
+                    not priority_submission_ready
+                    and future_submission_queue
                     and now + rpc_timeout_seconds
                     >= future_submission_queue[0][0]
                 ):
@@ -498,6 +528,31 @@ def run_replay_workload(
                         submission_burst_sizes[next_submission_at],
                         concurrency,
                     )
+                    if (
+                        kind == "receipt"
+                        and accepted[receipt_queue[0][2]].deadline
+                        <= next_submission_at
+                    ):
+                        # Do not reserve past a receipt's hard deadline.
+                        reserved_submission_slots = 0
+                    elif kind == "submission":
+                        reserved_submission_slots = min(
+                            reserved_submission_slots,
+                            max(concurrency - 1, 0),
+                        )
+
+                    if (
+                        kind == "receipt"
+                        and submission_ready
+                        and len(in_flight)
+                        >= concurrency - reserved_submission_slots
+                    ):
+                        kind = "submission"
+                        reserved_submission_slots = min(
+                            reserved_submission_slots,
+                            max(concurrency - 1, 0),
+                        )
+
                     if len(in_flight) >= concurrency - reserved_submission_slots:
                         reserved_task_wake_at = next_submission_at
                         if receipt_ready:
@@ -514,6 +569,11 @@ def run_replay_workload(
                     )
                     scheduled_at = -neg_scheduled_at
                     submission_burst_sizes[scheduled_at] -= 1
+                    if (
+                        priority_burst_launches > 0
+                        and scheduled_at == priority_burst_at
+                    ):
+                        priority_burst_launches -= 1
                     future = executor.submit(
                         execute_call,
                         "eth_sendRawTransaction",

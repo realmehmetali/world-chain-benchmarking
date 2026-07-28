@@ -8,10 +8,12 @@ import json
 import threading
 import time
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 from agent_rpc_load import (
     JsonRpcClient,
@@ -208,6 +210,28 @@ class AgentRpcLoadTests(unittest.TestCase):
             summary["transport_error_types"],
             {"BadStatusLine": 1},
         )
+
+    def test_http_error_body_timeout_is_a_transport_error(self) -> None:
+        class TimeoutBody:
+            def read(self) -> bytes:
+                raise TimeoutError
+
+            def close(self) -> None:
+                pass
+
+        http_error = urllib.error.HTTPError(
+            self.client.rpc_url,
+            503,
+            "Service Unavailable",
+            {},
+            TimeoutBody(),
+        )
+
+        with patch("urllib.request.urlopen", side_effect=http_error):
+            result = self.client.call("test_http_error_timeout", [])
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.transport_error, "TimeoutError")
 
     def test_read_workload_uses_every_agent_and_method(self) -> None:
         summary = run_read_workload(
@@ -456,6 +480,139 @@ class AgentRpcLoadTests(unittest.TestCase):
 
         self.assertEqual(submissions, ["0x01", "0x03", "0x02"])
         self.assertEqual(summary["receipts"]["confirmed"], 3)
+        self.assertEqual(summary["receipts"]["timed_out"], 0)
+
+    def test_replay_does_not_pre_idle_pool_for_future_full_burst(self) -> None:
+        client = ReplayClient(
+            confirmed_transactions={"0x01", "0x02", "0x03", "0x04"},
+        )
+        client.timeout_seconds = 0.1
+        records = [
+            ReplayRecord("agent-1", "0x01", "initial-1"),
+            ReplayRecord("agent-2", "0x02", "initial-2"),
+            ReplayRecord("agent-1", "0x03", "replacement-1", send_after_ms=20),
+            ReplayRecord("agent-2", "0x04", "replacement-2", send_after_ms=20),
+        ]
+
+        summary = run_replay_workload(
+            client,
+            records=records,
+            concurrency=2,
+            receipt_timeout_seconds=1.0,
+            receipt_poll_interval_seconds=0.001,
+        )
+
+        submissions = [
+            value
+            for method, value, _ in client.events
+            if method == "eth_sendRawTransaction"
+        ]
+
+        self.assertEqual(submissions[:2], ["0x01", "0x02"])
+        self.assertEqual(summary["receipts"]["confirmed"], 4)
+        self.assertEqual(summary["receipts"]["timed_out"], 0)
+
+    def test_replay_polls_receipt_due_before_future_full_burst(self) -> None:
+        client = ReplayClient(
+            confirmed_transactions={"0x01", "0x02", "0x03"},
+        )
+        client.timeout_seconds = 0.2
+        records = [
+            ReplayRecord("agent-1", "0x01", "initial"),
+            ReplayRecord("agent-1", "0x02", "replacement-1", send_after_ms=100),
+            ReplayRecord("agent-2", "0x03", "replacement-2", send_after_ms=100),
+        ]
+
+        summary = run_replay_workload(
+            client,
+            records=records,
+            concurrency=2,
+            receipt_timeout_seconds=0.05,
+            receipt_poll_interval_seconds=0.001,
+        )
+
+        initial_hash = client.transaction_hash("0x01")
+        initial_polls = [
+            event
+            for event in client.events
+            if event[0] == "eth_getTransactionReceipt"
+            and event[1] == initial_hash
+        ]
+
+        self.assertEqual(len(initial_polls), 1)
+        self.assertEqual(summary["receipts"]["confirmed"], 3)
+        self.assertEqual(summary["receipts"]["timed_out"], 0)
+
+    def test_replay_delayed_batch_does_not_starve_receipts(self) -> None:
+        transactions = {f"0x{index:02x}" for index in range(1, 7)}
+        client = ReplayClient(
+            confirmed_transactions=transactions,
+            submission_delay_seconds=0.02,
+        )
+        records = [ReplayRecord("agent-1", "0x01", "initial")]
+        records.extend(
+            ReplayRecord(
+                f"agent-{index}",
+                f"0x{index:02x}",
+                f"replacement-{index}",
+                send_after_ms=10,
+            )
+            for index in range(2, 7)
+        )
+
+        summary = run_replay_workload(
+            client,
+            records=records,
+            concurrency=1,
+            receipt_timeout_seconds=0.07,
+            receipt_poll_interval_seconds=0.001,
+        )
+
+        initial_hash = client.transaction_hash("0x01")
+        initial_polls = [
+            event
+            for event in client.events
+            if event[0] == "eth_getTransactionReceipt"
+            and event[1] == initial_hash
+        ]
+
+        self.assertEqual(len(initial_polls), 1)
+        self.assertEqual(summary["receipts"]["confirmed"], 6)
+        self.assertEqual(summary["receipts"]["timed_out"], 0)
+
+    def test_replay_due_burst_uses_capacity_before_later_reservation(self) -> None:
+        transactions = {f"0x{index:02x}" for index in range(1, 9)}
+        client = ReplayClient(
+            confirmed_transactions=transactions,
+            submission_delay_seconds=0.15,
+        )
+        records = [
+            ReplayRecord("agent-1", "0x01", "initial-1"),
+            ReplayRecord("agent-2", "0x02", "initial-2"),
+            ReplayRecord("agent-1", "0x03", "middle-1", send_after_ms=20),
+            ReplayRecord("agent-2", "0x04", "middle-2", send_after_ms=20),
+            ReplayRecord("agent-1", "0x05", "latest-1", send_after_ms=100),
+            ReplayRecord("agent-2", "0x06", "latest-2", send_after_ms=100),
+            ReplayRecord("agent-3", "0x07", "latest-3", send_after_ms=100),
+            ReplayRecord("agent-4", "0x08", "latest-4", send_after_ms=100),
+        ]
+
+        summary = run_replay_workload(
+            client,
+            records=records,
+            concurrency=4,
+            receipt_timeout_seconds=1.0,
+            receipt_poll_interval_seconds=0.001,
+        )
+
+        submissions = [
+            value
+            for method, value, _ in client.events
+            if method == "eth_sendRawTransaction"
+        ]
+
+        self.assertEqual(submissions[:4], ["0x01", "0x02", "0x03", "0x04"])
+        self.assertEqual(summary["receipts"]["confirmed"], 8)
         self.assertEqual(summary["receipts"]["timed_out"], 0)
 
     def test_replay_does_not_confirm_receipts_observed_after_deadline(self) -> None:
