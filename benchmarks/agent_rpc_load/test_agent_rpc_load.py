@@ -80,7 +80,10 @@ class ReplayClient:
         }
         self.receipt_delay_seconds = receipt_delay_seconds
         self.submission_delay_seconds = submission_delay_seconds
-        self.timeout_seconds = receipt_delay_seconds
+        self.timeout_seconds = max(
+            receipt_delay_seconds,
+            submission_delay_seconds,
+        )
         self.lock = threading.Lock()
         self.events: list[tuple[str, str, float]] = []
 
@@ -120,6 +123,10 @@ def make_handler(state: MockRpcState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             length = int(self.headers["Content-Length"])
             request = json.loads(self.rfile.read(length))
+            if request["method"] == "test_bad_status_line":
+                self.connection.sendall(b"this is not an HTTP status line\r\n\r\n")
+                self.close_connection = True
+                return
             if request["method"] == "test_truncated":
                 body = b'{"jsonrpc":"2.0","id":1'
                 self.send_response(200)
@@ -186,6 +193,20 @@ class AgentRpcLoadTests(unittest.TestCase):
         self.assertEqual(
             summary["transport_error_types"],
             {"IncompleteRead": 1},
+        )
+
+    def test_malformed_http_status_is_a_transport_error(self) -> None:
+        result = self.client.call("test_bad_status_line", [])
+        metrics = Metrics()
+        metrics.record(result)
+        summary = metrics.summary(1.0)["overall"]
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.transport_error, "BadStatusLine")
+        self.assertEqual(summary["transport_errors"], 1)
+        self.assertEqual(
+            summary["transport_error_types"],
+            {"BadStatusLine": 1},
         )
 
     def test_read_workload_uses_every_agent_and_method(self) -> None:
@@ -399,6 +420,42 @@ class AgentRpcLoadTests(unittest.TestCase):
             )
         )
         self.assertEqual(summary["receipts"]["confirmed"], 4)
+        self.assertEqual(summary["receipts"]["timed_out"], 0)
+
+    def test_replay_prioritizes_later_burst_over_slow_submission_backlog(
+        self,
+    ) -> None:
+        client = ReplayClient(
+            confirmed_transactions={"0x01", "0x02", "0x03"},
+            submission_delay_seconds=0.1,
+        )
+        records = [
+            ReplayRecord("agent-1", "0x01", "initial-1"),
+            ReplayRecord("agent-2", "0x02", "initial-2"),
+            ReplayRecord(
+                "agent-1",
+                "0x03",
+                "replacement",
+                send_after_ms=20,
+            ),
+        ]
+
+        summary = run_replay_workload(
+            client,
+            records=records,
+            concurrency=2,
+            receipt_timeout_seconds=1.0,
+            receipt_poll_interval_seconds=0.001,
+        )
+
+        submissions = [
+            value
+            for method, value, _ in client.events
+            if method == "eth_sendRawTransaction"
+        ]
+
+        self.assertEqual(submissions, ["0x01", "0x03", "0x02"])
+        self.assertEqual(summary["receipts"]["confirmed"], 3)
         self.assertEqual(summary["receipts"]["timed_out"], 0)
 
     def test_replay_does_not_confirm_receipts_observed_after_deadline(self) -> None:

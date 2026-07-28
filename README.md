@@ -77,6 +77,11 @@ start of the run. The report separates submission errors by JSON-RPC error code
 and records confirmation or timeout plus receipt latency for every accepted
 transaction.
 
+Replay enforces one global concurrency limit across submissions and receipt
+polls. If slow calls make scheduled bursts overlap, the newest due burst takes
+priority over older unsent work so time-sensitive replacements can use the
+capacity reserved for them; the older backlog resumes afterward.
+
 ```bash
 just agent-load-replay ./synthetic-transactions.jsonl \
   http://127.0.0.1:8545 32 60

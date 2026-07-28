@@ -102,7 +102,7 @@ class JsonRpcClient:
         except urllib.error.HTTPError as error:
             try:
                 response_body = error.read()
-            except http.client.IncompleteRead as read_error:
+            except http.client.HTTPException as read_error:
                 return RpcCallResult(
                     method=method,
                     latency_ms=_elapsed_ms(started),
@@ -125,7 +125,7 @@ class JsonRpcClient:
                 transport_error=f"HTTP_{error.code}",
             )
         except (
-            http.client.IncompleteRead,
+            http.client.HTTPException,
             OSError,
             TimeoutError,
             urllib.error.URLError,
@@ -396,16 +396,17 @@ def run_replay_workload(
     scheduled_records = sorted(
         enumerate(records), key=lambda item: (item[1].send_after_ms, item[0])
     )
-    submission_queue = [
+    future_submission_queue = [
         (started + record.send_after_ms / 1000, order, record)
         for order, (_, record) in enumerate(scheduled_records)
     ]
+    ready_submission_queue: list[tuple[float, int, ReplayRecord]] = []
     submission_burst_sizes: dict[float, int] = {}
-    for scheduled_at, _, _ in submission_queue:
+    for scheduled_at, _, _ in future_submission_queue:
         submission_burst_sizes[scheduled_at] = (
             submission_burst_sizes.get(scheduled_at, 0) + 1
         )
-    heapq.heapify(submission_queue)
+    heapq.heapify(future_submission_queue)
     receipt_queue: list[tuple[float, int, str]] = []
     accepted: dict[str, _ReceiptTracker] = {}
     accepted_submissions = 0
@@ -431,14 +432,33 @@ def run_replay_workload(
     # Workers perform one RPC attempt at a time. The coordinator owns all
     # scheduling waits, preserving the global concurrency limit.
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        while submission_queue or receipt_queue or in_flight:
-            reserved_receipt_wake_at = math.inf
+        while (
+            future_submission_queue
+            or ready_submission_queue
+            or receipt_queue
+            or in_flight
+        ):
+            reserved_task_wake_at = math.inf
 
             while len(in_flight) < concurrency:
                 now = time.perf_counter()
-                submission_ready = (
-                    bool(submission_queue) and submission_queue[0][0] <= now
-                )
+                # Under a strict global cap, overlapping bursts cannot all
+                # retain their original timing once earlier calls run long.
+                # Newer due bursts therefore take deterministic precedence
+                # over older backlog; the backlog resumes after they launch.
+                while (
+                    future_submission_queue
+                    and future_submission_queue[0][0] <= now
+                ):
+                    scheduled_at, submission_order, record = heapq.heappop(
+                        future_submission_queue
+                    )
+                    heapq.heappush(
+                        ready_submission_queue,
+                        (-scheduled_at, submission_order, record),
+                    )
+
+                submission_ready = bool(ready_submission_queue)
                 receipt_ready = bool(receipt_queue) and receipt_queue[0][0] <= now
                 if not submission_ready and not receipt_ready:
                     break
@@ -464,35 +484,35 @@ def run_replay_workload(
                 else:
                     kind = "receipt"
 
-                # A receipt attempt can run until the RPC timeout. Preserve
+                # Any RPC attempt can run until the RPC timeout. Preserve
                 # enough capacity for the entire next scheduled burst when
-                # the attempt could overlap its deadline. Calls that can
-                # finish before the deadline may still use the full pool.
+                # the attempt could overlap its deadline. This applies to
+                # earlier submissions as well as receipt polls.
                 if (
-                    kind == "receipt"
-                    and submission_queue
-                    and now + rpc_timeout_seconds >= submission_queue[0][0]
+                    future_submission_queue
+                    and now + rpc_timeout_seconds
+                    >= future_submission_queue[0][0]
                 ):
-                    next_submission_at = submission_queue[0][0]
+                    next_submission_at = future_submission_queue[0][0]
                     reserved_submission_slots = min(
                         submission_burst_sizes[next_submission_at],
                         concurrency,
                     )
                     if len(in_flight) >= concurrency - reserved_submission_slots:
-                        if submission_ready:
-                            kind = "submission"
-                        else:
+                        reserved_task_wake_at = next_submission_at
+                        if receipt_ready:
                             transaction_hash = receipt_queue[0][2]
-                            reserved_receipt_wake_at = min(
+                            reserved_task_wake_at = min(
                                 next_submission_at,
                                 accepted[transaction_hash].deadline,
                             )
-                            break
+                        break
 
                 if kind == "submission":
-                    scheduled_at, submission_order, record = heapq.heappop(
-                        submission_queue
+                    neg_scheduled_at, submission_order, record = heapq.heappop(
+                        ready_submission_queue
                     )
+                    scheduled_at = -neg_scheduled_at
                     submission_burst_sizes[scheduled_at] -= 1
                     future = executor.submit(
                         execute_call,
@@ -518,10 +538,14 @@ def run_replay_workload(
                 last_scheduled_kind = kind
 
             next_receipt_due = receipt_queue[0][0] if receipt_queue else math.inf
-            if reserved_receipt_wake_at < math.inf:
-                next_receipt_due = reserved_receipt_wake_at
+            if reserved_task_wake_at < math.inf:
+                next_receipt_due = reserved_task_wake_at
             next_due = min(
-                submission_queue[0][0] if submission_queue else math.inf,
+                (
+                    future_submission_queue[0][0]
+                    if future_submission_queue
+                    else math.inf
+                ),
                 next_receipt_due,
             )
 
